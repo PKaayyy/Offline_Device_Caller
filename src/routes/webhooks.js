@@ -9,8 +9,13 @@ const { verifyElevenLabsSignature } = require("../utils/elevenLabsWebhook");
 
 const router = express.Router();
 
+// Enable URL-encoded parameter parsing (required to process form payloads sent by Exotel)
 router.use(express.urlencoded({ extended: true }));
 
+/**
+ * Utility: Scans a webhook request envelope to find a valid phone number candidate.
+ * Different APIs name phone fields differently, so this helper standardizes lookup keys.
+ */
 function extractPhoneFromWebhook(body) {
   return (
     body?.to_number ||
@@ -23,6 +28,11 @@ function extractPhoneFromWebhook(body) {
   );
 }
 
+/**
+ * Formats database customer fields into key-value context variables for ElevenLabs.
+ * ElevenLabs conversational AI agents inject these parameters dynamically into their
+ * system instructions (e.g. "Hello {cx_name}, you have {offline_units} units offline...").
+ */
 function buildDynamicVariables(customer) {
   return {
     cx_name: customer.cxName,
@@ -35,6 +45,9 @@ function buildDynamicVariables(customer) {
   };
 }
 
+/**
+ * Parses raw request body streams as JSON.
+ */
 function parseElevenLabsEvent(rawBody) {
   try {
     return JSON.parse(rawBody);
@@ -43,22 +56,26 @@ function parseElevenLabsEvent(rawBody) {
   }
 }
 
+/**
+ * Validates HMAC SHA-256 signatures if an ELEVENLABS_WEBHOOK_SECRET is defined in .env.
+ */
 function verifyElevenLabsWebhookIfConfigured(rawBody, signatureHeader) {
   const secret = process.env.ELEVENLABS_WEBHOOK_SECRET;
-  if (!secret) return;
+  if (!secret) return; // Skip validation if secret is not set (e.g. during development testing)
 
   verifyElevenLabsSignature(rawBody, signatureHeader, secret);
 }
 
 /**
  * POST /webhooks/exotel/status
- * Exotel StatusCallback when a call reaches a terminal state.
+ * Triggered by Exotel when a call enters a terminal state (Completed, No Answer, Failed).
  */
 router.post("/webhooks/exotel/status", async (req, res) => {
   try {
     const payload = req.body || {};
     console.log("Exotel status webhook:", JSON.stringify(payload));
 
+    // Update database call logs and duration parameters
     const result = await handleExotelStatusCallback(payload);
     if (!result.ok) {
       console.warn("Exotel status webhook: customer not matched", result);
@@ -73,12 +90,15 @@ router.post("/webhooks/exotel/status", async (req, res) => {
 
 /**
  * POST /webhooks/elevenlabs/init
- * ElevenLabs conversation initiation — return dynamic variables for the agent.
+ * Triggered by ElevenLabs during conversation initiation.
+ * ElevenLabs requests customer context details. We find the customer by phone 
+ * and return dynamic variables containing their device support counts.
  */
 router.post("/webhooks/elevenlabs/init", async (req, res) => {
   try {
     console.log("ElevenLabs init webhook received:", JSON.stringify(req.body, null, 2));
 
+    // Resolve the caller phone number
     const phone = extractPhoneFromWebhook(req.body);
     const customer = phone ? await findCustomerByPhone(phone) : null;
 
@@ -91,8 +111,10 @@ router.post("/webhooks/elevenlabs/init", async (req, res) => {
       });
     }
 
+    // Connect the call state to this active conversation ID
     await handleElevenLabsInit(customer, req.body);
 
+    // Build the dynamic parameters response payload required by ElevenLabs
     const payload = {
       type: "conversation_initiation_client_data",
       dynamic_variables: buildDynamicVariables(customer),
@@ -107,22 +129,25 @@ router.post("/webhooks/elevenlabs/init", async (req, res) => {
 
 /**
  * POST /webhooks/elevenlabs/post-call
- * ElevenLabs post-call transcription / initiation-failure events.
- * Configure this URL in ElevenLabs agent post-call webhook settings.
+ * Triggered by ElevenLabs when a call terminates.
+ * Delivers transcription results, duration parameters, and failure diagnostics.
  */
 router.post(
   "/webhooks/elevenlabs/post-call",
+  // Capture raw text string to enable valid cryptographic signature validations
   express.text({ type: "application/json" }),
   async (req, res) => {
     try {
       const rawBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body || {});
       const signature = req.headers["elevenlabs-signature"];
 
+      // Verify request signature to secure endpoint
       verifyElevenLabsWebhookIfConfigured(rawBody, signature);
 
       const event = parseElevenLabsEvent(rawBody);
       console.log("ElevenLabs post-call webhook:", event.type);
 
+      // Process event (updates transcripts / completes call status)
       const result = await handleElevenLabsLifecycleEvent(event);
       if (!result.ok) {
         console.warn("ElevenLabs post-call webhook: customer not matched", result);

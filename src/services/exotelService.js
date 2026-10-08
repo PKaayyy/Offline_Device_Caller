@@ -1,5 +1,8 @@
 const axios = require("axios");
 
+/**
+ * Validates that all necessary Exotel configuration variables are present in the .env file.
+ */
 function isConfigured() {
   return Boolean(
     process.env.EXOTEL_API_KEY &&
@@ -9,6 +12,10 @@ function isConfigured() {
   );
 }
 
+/**
+ * Derives the URL where Exotel should send call events when a call completes.
+ * Fallbacks to localhost port 3001 if no custom callback URL is specified in .env.
+ */
 function getStatusCallbackUrl() {
   if (process.env.EXOTEL_STATUS_CALLBACK_URL) {
     return process.env.EXOTEL_STATUS_CALLBACK_URL;
@@ -20,7 +27,12 @@ function getStatusCallbackUrl() {
 }
 
 /**
- * Trigger an Exotel outbound call and register a StatusCallback for lifecycle updates.
+ * Initiates an outbound phone call via Exotel's API.
+ * Uses HTTP Basic Authentication to verify the API request with Exotel.
+ * Registers a StatusCallback URL to receive terminal events (call outcomes).
+ * 
+ * @param {string} toNumber - The customer's destination phone number to dial
+ * @param {string} customerId - The unique database ID of the customer (passed as CustomField)
  */
 async function triggerOutboundCall({ toNumber, customerId }) {
   if (!isConfigured()) {
@@ -36,20 +48,24 @@ async function triggerOutboundCall({ toNumber, customerId }) {
   const apiKey = process.env.EXOTEL_API_KEY;
   const apiToken = process.env.EXOTEL_API_TOKEN;
   const callerId = process.env.EXOTEL_CALLER_ID;
+  
+  // Exotel's official REST endpoint for placing connection calls
   const url = `https://${subdomain}/v1/Accounts/${accountSid}/Calls/connect.json`;
   const statusCallback = getStatusCallbackUrl();
 
+  // Placing API call via URL-encoded form POST parameters
   const response = await axios.post(
     url,
     new URLSearchParams({
-      From: callerId,
-      To: toNumber,
-      CallerId: callerId,
-      CustomField: customerId || "",
-      StatusCallback: statusCallback,
-      StatusCallbackEvents: "terminal",
+      From: callerId,               // The virtual number that dials out
+      To: toNumber,                 // The customer receiving the call
+      CallerId: callerId,           // Number shown on the customer's caller ID display
+      CustomField: customerId || "",// Custom metadata payload (allows us to associate webhook results back to our customer document)
+      StatusCallback: statusCallback, // The webhook endpoint where Exotel will send results
+      StatusCallbackEvents: "terminal", // Tells Exotel to send updates ONLY when the call ends (terminal state)
     }).toString(),
     {
+      // Basic Authentication header configuration (apiKey is username, apiToken is password)
       auth: { username: apiKey, password: apiToken },
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
     }

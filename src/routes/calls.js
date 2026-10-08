@@ -7,14 +7,17 @@ const router = express.Router();
 
 /**
  * POST /calls/trigger
- * Body: { "customerId": "<mongo id>" } OR { "toNumber": "+91..." }
- *
- * Phase 4: starts an Exotel outbound call for one customer.
+ * Body parameters: { "customerId": "<Object ID>" } OR { "toNumber": "+91..." }
+ * 
+ * Use case: Triggers an automated follow-up call. Supports developer simulation mode.
  */
 router.post("/calls/trigger", async (req, res) => {
   try {
+    // 1. Determine if we are running in simulation mode.
+    // Simulates calls if SIMULATE_CALLS is true, or if Exotel credentials are missing from .env.
     const simulate = process.env.SIMULATE_CALLS !== "false" && (!isConfigured() || process.env.SIMULATE_CALLS === "true");
 
+    // If simulation is turned off and Exotel is not configured, deny request
     if (!simulate && !isConfigured()) {
       return res.status(503).json({
         ok: false,
@@ -26,6 +29,7 @@ router.post("/calls/trigger", async (req, res) => {
     const { customerId, toNumber } = req.body || {};
     let customer = null;
 
+    // 2. Resolve customer by ID if provided
     if (customerId) {
       customer = await findCustomerById(customerId);
       if (!customer) {
@@ -33,6 +37,7 @@ router.post("/calls/trigger", async (req, res) => {
       }
     }
 
+    // Determine the phone number to dial
     const dialNumber = toNumber || customer?.cxNumber;
     if (!dialNumber) {
       return res.status(400).json({
@@ -42,7 +47,11 @@ router.post("/calls/trigger", async (req, res) => {
     }
 
     let exotelResponse;
+    
+    // 3. EXECUTE: Simulation vs. Live API call
     if (simulate) {
+      // --- SIMULATION MODE ---
+      // Generate a mock Exotel Call SID
       exotelResponse = {
         Call: {
           Sid: `mock_exotel_sid_${Math.random().toString(36).substring(7)}`,
@@ -51,21 +60,26 @@ router.post("/calls/trigger", async (req, res) => {
       };
       console.log(`[Simulation] Call simulated for ${dialNumber}. Exotel SID: ${exotelResponse.Call.Sid}`);
 
-      // Schedule a background timeout to simulate call completion via status callback
+      // Schedule a background timeout task (6 seconds) to mock a terminal webhook update.
+      // This lets developers test the live status transition polling without configuring Exotel.
       if (customer) {
         const { handleExotelStatusCallback } = require("../services/callStatusService");
+        
         setTimeout(async () => {
           try {
             console.log(`[Simulation] Simulating webhook callback for customer: ${customer.cxName}`);
+            
+            // Randomly pick a terminal status outcome to test different visual badge flows
             const randomStatuses = ["completed", "completed", "no_answer", "failed"];
             const selectedStatus = randomStatuses[Math.floor(Math.random() * randomStatuses.length)];
 
+            // Call the status callback coordinator service as if an external HTTP request was received
             await handleExotelStatusCallback({
               CallSid: exotelResponse.Call.Sid,
-              CustomField: customer._id.toString(),
+              CustomField: customer._id.toString(), // Passes customer Object ID to resolve matching document
               To: customer.cxNumber,
               Status: selectedStatus,
-              ConversationDuration: Math.floor(Math.random() * 45) + 15,
+              ConversationDuration: Math.floor(Math.random() * 45) + 15, // Mock 15-60 seconds call duration
               RecordingUrl: "https://api.exotel.com/v1/Accounts/mock/Recordings/mock_recording.mp3",
             });
             console.log(`[Simulation] Webhook simulation complete. Status set to: ${selectedStatus}`);
@@ -75,12 +89,15 @@ router.post("/calls/trigger", async (req, res) => {
         }, 6000);
       }
     } else {
+      // --- LIVE MODE ---
+      // Connects to the official Exotel REST endpoint
       exotelResponse = await triggerOutboundCall({
         toNumber: dialNumber,
         customerId: customer?._id?.toString(),
       });
     }
 
+    // 4. Update customer call state in MongoDB to 'calling'
     if (customer) {
       customer.callStatus = "calling";
       customer.lastCallAttemptAt = new Date();

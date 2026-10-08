@@ -5,11 +5,16 @@ const router = express.Router();
 
 /**
  * POST /sync
- * Pull latest customers from Zoho Projects and save to MongoDB.
+ * Manual trigger endpoint:
+ * Downloads the latest offline-device support tasks from Zoho Projects,
+ * parses customer details, and upserts them in MongoDB.
  */
 router.post("/sync", async (_req, res) => {
   try {
+    // 1. Run the sync service orchestration
     const result = await syncCustomersFromZoho();
+    
+    // 2. Return success results containing sync statistics
     res.json({
       ok: true,
       message: "Zoho sync completed",
@@ -20,6 +25,8 @@ router.post("/sync", async (_req, res) => {
     });
   } catch (error) {
     console.error("Zoho sync failed:", error.message);
+    
+    // 3. Return structured error response if sync fails (e.g. invalid Zoho API keys)
     res.status(500).json({
       ok: false,
       error: error.message,

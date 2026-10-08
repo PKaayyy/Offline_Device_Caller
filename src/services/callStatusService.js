@@ -1,12 +1,22 @@
 const Customer = require("../models/Customer");
 const { findCustomerById, findCustomerByPhone, normalizePhone } = require("./customerService");
 
+// Define terminal states. Once a call reaches a terminal state, its status is locked 
+// and cannot be reverted back to active states like "calling".
 const TERMINAL_STATUSES = new Set(["completed", "failed", "no_answer", "skipped"]);
 
+/**
+ * Normalizes text tags for comparison.
+ */
 function normalizeKey(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+/**
+ * Checks state validation rules before changing the call status.
+ * If the current status is terminal (e.g. completed) and the next status is "calling",
+ * we skip the update to prevent out-of-order webhooks from overwriting completed calls.
+ */
 function canApplyStatus(currentStatus, nextStatus) {
   if (!nextStatus) return false;
   if (currentStatus === nextStatus) return true;
@@ -14,6 +24,9 @@ function canApplyStatus(currentStatus, nextStatus) {
   return true;
 }
 
+/**
+ * Maps Exotel call outcome codes to our database's customer status options.
+ */
 function mapExotelStatus(status) {
   const normalized = normalizeKey(status);
 
@@ -31,6 +44,9 @@ function mapExotelStatus(status) {
   return null;
 }
 
+/**
+ * Maps ElevenLabs call failure outcomes.
+ */
 function mapElevenLabsFailureReason(reason) {
   const normalized = normalizeKey(reason);
   if (normalized === "busy" || normalized === "no-answer") return "no_answer";
@@ -38,6 +54,10 @@ function mapElevenLabsFailureReason(reason) {
   return "failed";
 }
 
+/**
+ * Searches the database to find the customer associated with a webhook.
+ * Tries resolving by Customer MongoDB ID, Exotel Call SID, or Phone number.
+ */
 async function findCustomerForWebhook({ customerId, callSid, phone }) {
   if (customerId) {
     const byId = await findCustomerById(customerId);
@@ -56,10 +76,15 @@ async function findCustomerForWebhook({ customerId, callSid, phone }) {
   return null;
 }
 
+/**
+ * Scans an ElevenLabs webhook payload to find the phone number.
+ */
 function extractPhoneFromElevenLabsData(data = {}) {
+  // Check in the custom dynamic variables payload
   const dynamicPhone = data.conversation_initiation_client_data?.dynamic_variables?.cx_number;
   if (dynamicPhone) return normalizePhone(dynamicPhone);
 
+  // Check common properties within standard metadata envelopes
   const metadata = data.metadata || {};
   const candidates = [
     metadata.to_number,
@@ -77,12 +102,16 @@ function extractPhoneFromElevenLabsData(data = {}) {
   return null;
 }
 
+/**
+ * Safely applies an update block to a customer document if status state-lock rules allow.
+ */
 async function applyCustomerCallUpdate(customer, updates) {
   const nextStatus = updates.callStatus;
   if (nextStatus && !canApplyStatus(customer.callStatus, nextStatus)) {
     return { customer, skipped: true, reason: "status_already_terminal" };
   }
 
+  // Update properties on the Mongoose document and commit changes to the database
   Object.assign(customer, updates);
   await customer.save();
 
@@ -90,7 +119,9 @@ async function applyCustomerCallUpdate(customer, updates) {
 }
 
 /**
- * Exotel StatusCallback payload (form-encoded or JSON).
+ * Webhook handler for Exotel Status callbacks.
+ * Triggered when a call reaches a terminal state.
+ * Extracts metrics like duration, recording link, and outcome status.
  */
 async function handleExotelStatusCallback(payload = {}) {
   const callSid = payload.CallSid || payload.call_sid || null;
@@ -98,6 +129,7 @@ async function handleExotelStatusCallback(payload = {}) {
   const phone = normalizePhone(payload.To || payload.to || payload.Called);
   const mappedStatus = mapExotelStatus(payload.Status || payload.status);
 
+  // 1. Locate the customer document
   const customer = await findCustomerForWebhook({
     customerId: customField,
     callSid,
@@ -114,6 +146,7 @@ async function handleExotelStatusCallback(payload = {}) {
     };
   }
 
+  // 2. Prepare database updates
   const updates = {
     exotelCallSid: callSid || customer.exotelCallSid,
     lastCallAttemptAt: customer.lastCallAttemptAt || new Date(),
@@ -142,6 +175,7 @@ async function handleExotelStatusCallback(payload = {}) {
     updates.lastError = null;
   }
 
+  // 3. Write updates to MongoDB
   const result = await applyCustomerCallUpdate(customer, updates);
 
   return {
@@ -154,12 +188,13 @@ async function handleExotelStatusCallback(payload = {}) {
 }
 
 /**
- * ElevenLabs post-call / failure webhook event (parsed JSON).
+ * Webhook handler for ElevenLabs post-call status and failure lifecycle updates.
  */
 async function handleElevenLabsLifecycleEvent(event = {}) {
   const type = event.type;
   const data = event.data || {};
 
+  // Ignore post-call audio events (we play recording audio via Exotel's recording links instead)
   if (type === "post_call_audio") {
     return { ok: true, ignored: true, reason: "post_call_audio_not_stored" };
   }
@@ -167,6 +202,7 @@ async function handleElevenLabsLifecycleEvent(event = {}) {
   const conversationId = data.conversation_id || null;
   const phone = extractPhoneFromElevenLabsData(data);
 
+  // Locate the customer document using the ElevenLabs conversation ID
   let customer = null;
   if (conversationId) {
     customer = await Customer.findOne({ elevenLabsConversationId: conversationId });
@@ -189,7 +225,9 @@ async function handleElevenLabsLifecycleEvent(event = {}) {
     elevenLabsConversationId: conversationId || customer.elevenLabsConversationId,
   };
 
+  // Process the type of ElevenLabs event
   if (type === "post_call_transcription") {
+    // When the transcription is completed, we mark the call as completed
     updates.callStatus = "completed";
     updates.callCompletedAt = new Date();
     updates.lastError = null;
@@ -199,6 +237,7 @@ async function handleElevenLabsLifecycleEvent(event = {}) {
       updates.callDurationSecs = duration;
     }
   } else if (type === "call_initiation_failure") {
+    // If the call failed to start (e.g. invalid phone number, unreachable)
     updates.callStatus = mapElevenLabsFailureReason(data.failure_reason);
     updates.callCompletedAt = new Date();
     updates.lastError = `ElevenLabs initiation failure: ${data.failure_reason || "unknown"}`;
@@ -206,6 +245,7 @@ async function handleElevenLabsLifecycleEvent(event = {}) {
     return { ok: true, ignored: true, reason: `unhandled_event_type:${type}` };
   }
 
+  // Save changes to database
   const result = await applyCustomerCallUpdate(customer, updates);
 
   return {
@@ -219,7 +259,8 @@ async function handleElevenLabsLifecycleEvent(event = {}) {
 }
 
 /**
- * Store conversation id when ElevenLabs conversation starts.
+ * Triggered during call initiation when ElevenLabs starts a conversation.
+ * Links the customer document to the new conversation ID.
  */
 async function handleElevenLabsInit(customer, body = {}) {
   const conversationId =
